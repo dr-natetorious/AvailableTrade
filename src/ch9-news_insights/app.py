@@ -8,6 +8,10 @@ data replication, and search capabilities.
 """
 
 import os
+import subprocess
+import sys
+import shutil
+from pathlib import Path
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
@@ -33,6 +37,65 @@ if not (AWS_ACCOUNT_ID:= os.environ.get("AWS_DEFAULT_ACCOUNT", "593793064122")):
     raise ValueError("AWS_DEFAULT_ACCOUNT environment variable is not set.")
 if not (AWS_DEFAULT_REGION:= os.environ.get("AWS_DEFAULT_REGION", "us-east-1")):
     raise ValueError("AWS_DEFAULT_REGION environment variable is not set.")
+
+def build_lambda_layer():
+    """
+    Build Lambda layer with Redis and OpenSearch dependencies.
+    Returns the path to the layer directory.
+    """
+    current_dir = Path(__file__).parent
+    layers_dir = current_dir / "layers"
+    python_dir = layers_dir / "python"
+    layer_zip = layers_dir / "lambda-layer.zip"
+    
+    # Check if layer already exists and is recent
+    if layer_zip.exists():
+        print(f"Layer zip already exists at {layer_zip}")
+        return str(layers_dir)
+    
+    print("Building Lambda layer for Redis and OpenSearch dependencies...")
+    
+    # Create the layers directory structure
+    if python_dir.exists():
+        shutil.rmtree(python_dir)
+    
+    python_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Install packages directly to the python directory
+        print("Installing dependencies...")
+        subprocess.run([
+            sys.executable, "-m", "pip", "install",
+            "redis>=5.0.0,<6.0.0",
+            "opensearch-py>=2.4.0,<3.0.0",
+            "-t", str(python_dir),
+            "--upgrade",
+            "--no-cache-dir"
+        ], check=True, capture_output=True, text=True)
+        
+        # Clean up unnecessary files
+        cleanup_patterns = [
+            "*.dist-info",
+            "__pycache__",
+            "*.pyc",
+        ]
+        
+        for pattern in cleanup_patterns:
+            for item in python_dir.rglob(pattern):
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                elif item.is_file():
+                    item.unlink(missing_ok=True)
+        
+        print("Layer built successfully!")
+        return str(layers_dir)
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error building layer: {e}")
+        # Fall back to using existing structure if build fails
+        if layers_dir.exists():
+            return str(layers_dir)
+        raise
 
 class NewsInsightsStack(Stack):
     """
@@ -118,7 +181,7 @@ class NewsInsightsStack(Stack):
                 volume_type=ec2.EbsDeviceVolumeType.GP3
             ),
             vpc=vpc,
-            vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)],
+            vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC, one_per_az=True)],
             security_groups=[opensearch_security_group],
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -175,75 +238,24 @@ class NewsInsightsStack(Stack):
         # Lambda security group (create once and reuse)
         lambda_security_group = self._create_lambda_security_group(vpc)
 
+        # Build or check for Lambda layer
+        layer_path = build_lambda_layer()
+        
+        # Lambda layer for dependencies (using standard LayerVersion)
+        lambda_layer = lambda_.LayerVersion(
+            self, "NewsInsightsDependenciesLayer",
+            code=lambda_.Code.from_asset(layer_path),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
+            layer_version_name="news-insights-deps",
+            description="Redis and OpenSearch dependencies for news insights"
+        )
+
         # Lambda function for data replication (CDC)
         data_replicator = lambda_.Function(
             self, "DataReplicator",
             runtime=lambda_.Runtime.PYTHON_3_12,
-            handler="index.handler",
-            code=lambda_.Code.from_inline("""
-import json
-import boto3
-import redis
-from opensearchpy import OpenSearch
-import os
-
-def handler(event, context):
-    \"\"\"
-    Data replication function using Redis Streams for CDC
-    \"\"\"
-    
-    redis_endpoint = os.environ['REDIS_ENDPOINT']
-    opensearch_endpoint = os.environ['OPENSEARCH_ENDPOINT']
-    
-    # Connect to Redis
-    redis_client = redis.Redis(host=redis_endpoint, port=6379, decode_responses=True)
-    
-    # Connect to OpenSearch
-    opensearch_client = OpenSearch(
-        hosts=[{'host': opensearch_endpoint, 'port': 443}],
-        http_compress=True,
-        use_ssl=True,
-        verify_certs=True,
-        ssl_assert_hostname=False,
-        ssl_show_warn=False,
-    )
-    
-    # Process Redis stream events
-    try:
-        # Read from Redis stream
-        streams = redis_client.xread({'article_stream': '$'}, count=10, block=1000)
-        
-        for stream_name, messages in streams:
-            for message_id, fields in messages:
-                # Replicate to OpenSearch
-                doc_id = fields.get('article_id')
-                doc_body = {
-                    'title': fields.get('title', ''),
-                    'content': fields.get('content', ''),
-                    'url': fields.get('url', ''),
-                    'timestamp': fields.get('timestamp', ''),
-                    'source': fields.get('source', '')
-                }
-                
-                # Index in OpenSearch
-                opensearch_client.index(
-                    index='articles',
-                    id=doc_id,
-                    body=doc_body
-                )
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps('Data replication completed successfully')
-        }
-        
-    except Exception as e:
-        print(f"Error in data replication: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f'Error: {str(e)}')
-        }
-            """),
+            handler="handlers.DataReplicator_handler",
+            code=lambda_.Code.from_asset("functions"),
             environment={
                 'REDIS_ENDPOINT': redis_cluster.attr_primary_end_point_address,
                 'OPENSEARCH_ENDPOINT': opensearch_domain.domain_endpoint
@@ -252,7 +264,8 @@ def handler(event, context):
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             allow_public_subnet=True,
-            security_groups=[lambda_security_group]
+            security_groups=[lambda_security_group],
+            layers=[lambda_layer]
         )
 
         # Grant permissions to data replicator
@@ -271,93 +284,8 @@ def handler(event, context):
         search_api = lambda_.Function(
             self, "SearchAPI",
             runtime=lambda_.Runtime.PYTHON_3_12,
-            handler="index.handler",
-            code=lambda_.Code.from_inline("""
-import json
-import boto3
-from opensearchpy import OpenSearch
-import os
-
-def handler(event, context):
-    \"\"\"
-    Search API function for querying articles
-    \"\"\"
-    
-    opensearch_endpoint = os.environ['OPENSEARCH_ENDPOINT']
-    
-    # Connect to OpenSearch
-    opensearch_client = OpenSearch(
-        hosts=[{'host': opensearch_endpoint, 'port': 443}],
-        http_compress=True,
-        use_ssl=True,
-        verify_certs=True,
-        ssl_assert_hostname=False,
-        ssl_show_warn=False,
-    )
-    
-    try:
-        # Extract query parameters
-        query_params = event.get('queryStringParameters', {})
-        search_query = query_params.get('q', '*')
-        size = int(query_params.get('size', 10))
-        
-        # Search in OpenSearch
-        search_body = {
-            'query': {
-                'multi_match': {
-                    'query': search_query,
-                    'fields': ['title^2', 'content']
-                }
-            },
-            'size': size,
-            'sort': [
-                {'timestamp': {'order': 'desc'}}
-            ]
-        }
-        
-        response = opensearch_client.search(
-            index='articles',
-            body=search_body
-        )
-        
-        # Format results
-        results = []
-        for hit in response['hits']['hits']:
-            results.append({
-                'id': hit['_id'],
-                'title': hit['_source'].get('title', ''),
-                'content': hit['_source'].get('content', '')[:200] + '...',
-                'url': hit['_source'].get('url', ''),
-                'timestamp': hit['_source'].get('timestamp', ''),
-                'source': hit['_source'].get('source', ''),
-                'score': hit['_score']
-            })
-        
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'total': response['hits']['total']['value'],
-                'results': results
-            })
-        }
-        
-    except Exception as e:
-        print(f"Error in search API: {str(e)}")
-        return {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({
-                'error': str(e)
-            })
-        }
-            """),
+            handler="handlers.SearchAPI_handler",
+            code=lambda_.Code.from_asset("functions"),
             environment={
                 'OPENSEARCH_ENDPOINT': opensearch_domain.domain_endpoint
             },
@@ -365,7 +293,8 @@ def handler(event, context):
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             allow_public_subnet=True,
-            security_groups=[lambda_security_group]
+            security_groups=[lambda_security_group],
+            layers=[lambda_layer]
         )
 
         # Grant permissions to search API
