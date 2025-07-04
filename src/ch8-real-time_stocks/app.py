@@ -6,6 +6,7 @@ Chapter 8 - Streaming Architecture for Market Data
 Clean, focused CDK stack for learning streaming architectures.
 """
 
+import os
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
@@ -22,8 +23,14 @@ from aws_cdk import (
     Duration,
     CfnOutput
 )
+from aws_cdk.aws_lambda_event_sources import ManagedKafkaEventSource
 from constructs import Construct
 
+# Environment variables for AWS account and region
+if not (AWS_ACCOUNT_ID:= os.environ.get("AWS_DEFAULT_ACCOUNT", "593793064122")):
+    raise ValueError("AWS_DEFAULT_ACCOUNT environment variable is not set.")
+if not (AWS_DEFAULT_REGION:= os.environ.get("AWS_DEFAULT_REGION", "us-east-1")):
+    raise ValueError("AWS_DEFAULT_REGION environment variable is not set.")
 
 class RealtimeStocksStack(Stack):
     """
@@ -41,6 +48,9 @@ class RealtimeStocksStack(Stack):
 
         # Use default VPC
         vpc = ec2.Vpc.from_lookup(self, "DefaultVPC", is_default=True)
+
+        # Create MSK security group ONCE
+        msk_sg = self._create_msk_security_group(vpc)
 
         # S3 bucket for data storage
         data_bucket = s3.Bucket(
@@ -83,7 +93,7 @@ log.retention.bytes=1073741824
                         volume_size=10
                     )
                 ),
-                security_groups=[self._create_msk_security_group(vpc).security_group_id]
+                security_groups=[msk_sg.security_group_id]
             ),
             configuration_info=msk.CfnCluster.ConfigurationInfoProperty(
                 arn=msk_config.attr_arn,
@@ -192,18 +202,18 @@ def handler(event, context):
             timeout=Duration.minutes(5),
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
-            security_groups=[self._create_lambda_security_group(vpc)]
+            security_groups=[self._create_lambda_security_group(vpc, msk_sg)]
         )
 
-        # MSK event source mapping
-        lambda_.EventSourceMapping(
-            self, "MSKEventSourceMapping",
-            target=stock_processor,
-            event_source_arn=msk_cluster.attr_arn,
-            starting_position=lambda_.StartingPosition.LATEST,
-            topics=["stock-prices"],
-            batch_size=10,
-            maximum_batching_window=Duration.seconds(5)
+        # MSK event source mapping (use ManagedKafkaEventSource instead of EventSourceMapping)
+        stock_processor.add_event_source(
+            ManagedKafkaEventSource(
+                cluster_arn=msk_cluster.attr_arn,
+                topic="stock-prices",
+                starting_position=lambda_.StartingPosition.LATEST,
+                batch_size=10,
+                max_batching_window=Duration.seconds(5)
+            )
         )
 
         # Grant permissions to Lambda
@@ -358,7 +368,7 @@ def handler(event, context):
                     output_location=f"s3://{athena_results_bucket.bucket_name}/query-results/"
                 ),
                 enforce_work_group_configuration=True,
-                publish_cloud_watch_metrics=False
+                publish_cloud_watch_metrics_enabled=False
             )
         )
 
@@ -369,11 +379,11 @@ def handler(event, context):
             description="API Gateway URL for stock data enrichment"
         )
         
-        CfnOutput(
-            self, "MSKBootstrapServers", 
-            value=msk_cluster.attr_bootstrap_broker_string_tls,
-            description="MSK Bootstrap Servers"
-        )
+        # CfnOutput(
+        #     self, "MSKBootstrapServers", 
+        #     value=msk_cluster.broker_node_group_info.connectivity_info.to_string(),
+        #     description="MSK Bootstrap Servers"
+        # )
 
     def _create_msk_security_group(self, vpc: ec2.Vpc) -> ec2.SecurityGroup:
         """Create security group for MSK cluster"""
@@ -398,27 +408,27 @@ def handler(event, context):
         
         return sg
 
-    def _create_lambda_security_group(self, vpc: ec2.Vpc) -> ec2.SecurityGroup:
-        """Create security group for Lambda function"""
+    def _create_lambda_security_group(self, vpc: ec2.Vpc, msk_sg: ec2.SecurityGroup) -> ec2.SecurityGroup:
+        """Create security group for Lambda function and allow access to MSK SG"""
         lambda_sg = ec2.SecurityGroup(
             self, "LambdaSecurityGroup",
             vpc=vpc,
             description="Security group for Lambda functions",
             allow_all_outbound=True
         )
-        
         # Allow Lambda to communicate with MSK
-        msk_sg = self._create_msk_security_group(vpc)
         msk_sg.add_ingress_rule(
             peer=lambda_sg,
             connection=ec2.Port.tcp(9092),
             description="Allow Lambda to access MSK"
         )
-        
         return lambda_sg
-
 
 # CDK App
 app = cdk.App()
-RealtimeStocksStack(app, "RealtimeStocksStack")
+RealtimeStocksStack(app, "RealtimeStocksStack",
+                    env=cdk.Environment(
+                        account=AWS_ACCOUNT_ID,
+                        region=AWS_DEFAULT_REGION
+                    ))
 app.synth()
