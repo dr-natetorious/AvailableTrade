@@ -201,7 +201,8 @@ def handler(event, context):
             """),
             timeout=Duration.minutes(5),
             vpc=vpc,
-            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+            vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
+            allow_public_subnet=True,  # <-- added to allow Lambda in public subnet
             security_groups=[self._create_lambda_security_group(vpc, msk_sg)]
         )
 

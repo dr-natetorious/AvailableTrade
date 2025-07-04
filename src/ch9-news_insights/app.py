@@ -120,7 +120,7 @@ class NewsInsightsStack(Stack):
             vpc=vpc,
             vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC)],
             security_groups=[opensearch_security_group],
-            removal_policy=RemovalPolicy.DESTROY
+            removal_policy=RemovalPolicy.DESTROY,
         )
 
         # ECS cluster for article downloader
