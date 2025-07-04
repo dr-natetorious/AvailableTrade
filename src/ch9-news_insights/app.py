@@ -7,13 +7,14 @@ CDK stack for news feed ingestion with article downloading,
 data replication, and search capabilities.
 """
 
+import os
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
     aws_ec2 as ec2,
     aws_ecs as ecs,
     aws_elasticache as elasticache,
-    aws_opensearch as opensearch,
+    aws_opensearchservice as opensearch,
     aws_lambda as lambda_,
     aws_apigateway as apigateway,
     aws_iam as iam,
@@ -27,6 +28,11 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+# Environment variables for AWS account and region
+if not (AWS_ACCOUNT_ID:= os.environ.get("AWS_DEFAULT_ACCOUNT", "593793064122")):
+    raise ValueError("AWS_DEFAULT_ACCOUNT environment variable is not set.")
+if not (AWS_DEFAULT_REGION:= os.environ.get("AWS_DEFAULT_REGION", "us-east-1")):
+    raise ValueError("AWS_DEFAULT_REGION environment variable is not set.")
 
 class NewsInsightsStack(Stack):
     """
@@ -76,7 +82,7 @@ class NewsInsightsStack(Stack):
 
         redis_cluster = elasticache.CfnReplicationGroup(
             self, "RedisCluster",
-            description="Redis cluster for news insights",
+            replication_group_description="Redis cluster for news insights",
             cache_node_type="cache.t3.micro",
             engine="redis",
             num_cache_clusters=1,
@@ -121,7 +127,6 @@ class NewsInsightsStack(Stack):
         ecs_cluster = ecs.Cluster(
             self, "NewsDownloaderCluster",
             vpc=vpc,
-            container_insights=True
         )
 
         # ECS task definition for article downloader
@@ -153,6 +158,9 @@ class NewsInsightsStack(Stack):
         articles_bucket.grant_read_write(article_downloader_task.task_role)
         opensearch_domain.grant_read_write(article_downloader_task.task_role)
 
+        # ECS security group (create once and reuse)
+        ecs_security_group = self._create_ecs_security_group(vpc)
+
         # ECS service for article downloader (using public subnets for demo)
         article_downloader_service = ecs.FargateService(
             self, "ArticleDownloaderService",
@@ -161,8 +169,11 @@ class NewsInsightsStack(Stack):
             desired_count=1,
             assign_public_ip=True,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[self._create_ecs_security_group(vpc)]
+            security_groups=[ecs_security_group]
         )
+
+        # Lambda security group (create once and reuse)
+        lambda_security_group = self._create_lambda_security_group(vpc)
 
         # Lambda function for data replication (CDC)
         data_replicator = lambda_.Function(
@@ -240,7 +251,8 @@ def handler(event, context):
             timeout=Duration.minutes(5),
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[self._create_lambda_security_group(vpc)]
+            allow_public_subnet=True,
+            security_groups=[lambda_security_group]
         )
 
         # Grant permissions to data replicator
@@ -352,7 +364,8 @@ def handler(event, context):
             timeout=Duration.seconds(30),
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[self._create_lambda_security_group(vpc)]
+            allow_public_subnet=True,
+            security_groups=[lambda_security_group]
         )
 
         # Grant permissions to search API
@@ -396,7 +409,7 @@ def handler(event, context):
             cluster=ecs_cluster,
             task_definition=article_downloader_task,
             subnet_selection=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[self._create_ecs_security_group(vpc)]
+            security_groups=[ecs_security_group]
         ))
 
         # Outputs
@@ -435,5 +448,9 @@ def handler(event, context):
 
 # CDK App
 app = cdk.App()
-NewsInsightsStack(app, "NewsInsightsStack")
+NewsInsightsStack(app, "NewsInsightsStack",
+                  env=cdk.Environment(
+                    account=AWS_ACCOUNT_ID,
+                    region=AWS_DEFAULT_REGION
+                ))
 app.synth()
