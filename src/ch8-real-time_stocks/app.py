@@ -7,6 +7,8 @@ Clean, focused CDK stack for learning streaming architectures.
 """
 
 import os
+import boto3
+from botocore.exceptions import ClientError
 import aws_cdk as cdk
 from aws_cdk import (
     Stack,
@@ -32,6 +34,58 @@ if not (AWS_ACCOUNT_ID:= os.environ.get("AWS_DEFAULT_ACCOUNT", "593793064122")):
 if not (AWS_DEFAULT_REGION:= os.environ.get("AWS_DEFAULT_REGION", "us-east-1")):
     raise ValueError("AWS_DEFAULT_REGION environment variable is not set.")
 
+
+def get_or_create_default_vpc(scope: Construct) -> ec2.IVpc:
+    """
+    Get the default VPC or create one if it doesn't exist.
+    Uses boto3 to create a default VPC for cost efficiency.
+    Returns the VPC to use for the stack.
+    """
+    try:
+        # Try to lookup the default VPC first
+        vpc = ec2.Vpc.from_lookup(scope, "DefaultVPC", is_default=True)
+        print("Found existing default VPC")
+        return vpc
+    except Exception as e:
+        print(f"Default VPC not found: {e}")
+        print("Creating default VPC using AWS API for cost-efficient tutorial setup...")
+        
+        # Use boto3 to create a default VPC
+        try:
+            ec2_client = boto3.client('ec2')
+            
+            # Create default VPC - this is free and creates minimal infrastructure
+            response = ec2_client.create_default_vpc()
+            vpc_id = response['Vpc']['VpcId']
+            print(f"Created default VPC: {vpc_id}")
+            
+            # Wait a moment for the VPC to be fully available
+            import time
+            time.sleep(15)  # Increased wait time for stability
+            
+            # Now lookup the newly created default VPC
+            vpc = ec2.Vpc.from_lookup(scope, "DefaultVPC", is_default=True)
+            print("Successfully retrieved newly created default VPC")
+            return vpc
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'DefaultVpcAlreadyExists':
+                print("Default VPC already exists, looking up again...")
+                # Try lookup again
+                vpc = ec2.Vpc.from_lookup(scope, "DefaultVPC", is_default=True)
+                return vpc
+            elif error_code == 'UnauthorizedOperation':
+                print("Error: Insufficient permissions to create default VPC")
+                print("Please ensure your AWS credentials have ec2:CreateDefaultVpc permission")
+                raise
+            else:
+                print(f"Error creating default VPC: {e}")
+                raise
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            raise
+
 class RealtimeStocksStack(Stack):
     """
     CDK Stack for Real-Time Stock Market Data Analytics
@@ -46,8 +100,8 @@ class RealtimeStocksStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # Use default VPC
-        vpc = ec2.Vpc.from_lookup(self, "DefaultVPC", is_default=True)
+        # Get or create default VPC (cost-efficient approach for tutorials)
+        vpc = get_or_create_default_vpc(self)
 
         # Create MSK security group ONCE
         msk_sg = self._create_msk_security_group(vpc)
@@ -317,7 +371,7 @@ log.retention.bytes=1073741824
         #     description="MSK Bootstrap Servers"
         # )
 
-    def _create_msk_security_group(self, vpc: ec2.Vpc) -> ec2.SecurityGroup:
+    def _create_msk_security_group(self, vpc: ec2.IVpc) -> ec2.SecurityGroup:
         """Create security group for MSK cluster"""
         sg = ec2.SecurityGroup(
             self, "MSKSecurityGroup",
@@ -340,7 +394,7 @@ log.retention.bytes=1073741824
         
         return sg
 
-    def _create_lambda_security_group(self, vpc: ec2.Vpc, msk_sg: ec2.SecurityGroup) -> ec2.SecurityGroup:
+    def _create_lambda_security_group(self, vpc: ec2.IVpc, msk_sg: ec2.SecurityGroup) -> ec2.SecurityGroup:
         """Create security group for Lambda function and allow access to MSK SG"""
         lambda_sg = ec2.SecurityGroup(
             self, "LambdaSecurityGroup",
