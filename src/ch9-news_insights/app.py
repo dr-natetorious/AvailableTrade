@@ -12,6 +12,7 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
+from typing import Tuple
 import boto3
 from botocore.exceptions import ClientError
 import aws_cdk as cdk
@@ -168,8 +169,34 @@ class NewsInsightsStack(Stack):
         # Get or create default VPC (cost-efficient approach for tutorials)
         vpc = get_or_create_default_vpc(self)
 
-        # S3 bucket for storing downloaded articles
-        articles_bucket = s3.Bucket(
+        # Create core infrastructure components
+        articles_bucket = self._create_s3_bucket()
+        redis_cluster, redis_security_group = self._create_redis_cluster(vpc)
+        opensearch_domain, opensearch_security_group = self._create_opensearch_cluster(vpc)
+        
+        # Create ECS components for article downloading
+        ecs_cluster, article_downloader_service = self._create_ecs_components(
+            vpc, articles_bucket, redis_cluster, opensearch_domain
+        )
+        
+        # Create Lambda components for data processing
+        lambda_layer = self._create_lambda_layer()
+        data_replicator, search_api = self._create_lambda_functions(
+            vpc, redis_cluster, opensearch_domain, lambda_layer
+        )
+        
+        # Create API Gateway
+        search_api_gateway = self._create_api_gateway(search_api)
+        
+        # Create EventBridge rules for scheduling
+        self._create_eventbridge_rules(data_replicator, ecs_cluster, article_downloader_service)
+        
+        # Create outputs
+        self._create_outputs(search_api_gateway, opensearch_domain)
+
+    def _create_s3_bucket(self) -> s3.Bucket:
+        """Create S3 bucket for storing downloaded articles"""
+        return s3.Bucket(
             self, "ArticlesBucket",
             versioned=False,
             public_read_access=False,
@@ -178,13 +205,16 @@ class NewsInsightsStack(Stack):
             auto_delete_objects=True
         )
 
-        # Redis cluster for MemoryDB and CDC
+    def _create_redis_cluster(self, vpc: ec2.IVpc) -> Tuple[elasticache.CfnReplicationGroup, ec2.SecurityGroup]:
+        """Create Redis cluster for MemoryDB and CDC"""
+        # Redis subnet group
         redis_subnet_group = elasticache.CfnSubnetGroup(
             self, "RedisSubnetGroup",
             description="Subnet group for Redis cluster",
             subnet_ids=[subnet.subnet_id for subnet in vpc.public_subnets]
         )
 
+        # Redis security group
         redis_security_group = ec2.SecurityGroup(
             self, "RedisSecurityGroup",
             vpc=vpc,
@@ -198,6 +228,7 @@ class NewsInsightsStack(Stack):
             description="Redis access from VPC"
         )
 
+        # Redis cluster
         redis_cluster = elasticache.CfnReplicationGroup(
             self, "RedisCluster",
             replication_group_description="Redis cluster for news insights",
@@ -210,7 +241,11 @@ class NewsInsightsStack(Stack):
             multi_az_enabled=False
         )
 
-        # OpenSearch cluster for search capabilities
+        return redis_cluster, redis_security_group
+
+    def _create_opensearch_cluster(self, vpc: ec2.IVpc) -> Tuple[opensearch.Domain, ec2.SecurityGroup]:
+        """Create OpenSearch cluster for search capabilities"""
+        # OpenSearch security group
         opensearch_security_group = ec2.SecurityGroup(
             self, "OpenSearchSecurityGroup",
             vpc=vpc,
@@ -224,6 +259,7 @@ class NewsInsightsStack(Stack):
             description="OpenSearch HTTPS access from VPC"
         )
 
+        # OpenSearch domain
         opensearch_domain = opensearch.Domain(
             self, "NewsSearchDomain",
             version=opensearch.EngineVersion.OPENSEARCH_2_11,
@@ -241,13 +277,23 @@ class NewsInsightsStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # ECS cluster for article downloader
+        return opensearch_domain, opensearch_security_group
+
+    def _create_ecs_components(
+        self, 
+        vpc: ec2.IVpc, 
+        articles_bucket: s3.Bucket, 
+        redis_cluster: elasticache.CfnReplicationGroup,
+        opensearch_domain: opensearch.Domain
+    ) -> Tuple[ecs.Cluster, ecs.FargateService]:
+        """Create ECS cluster and service for article downloading"""
+        # ECS cluster
         ecs_cluster = ecs.Cluster(
             self, "NewsDownloaderCluster",
             vpc=vpc,
         )
 
-        # ECS task definition for article downloader
+        # ECS task definition
         article_downloader_task = ecs.FargateTaskDefinition(
             self, "ArticleDownloaderTask",
             memory_limit_mib=512,
@@ -276,10 +322,10 @@ class NewsInsightsStack(Stack):
         articles_bucket.grant_read_write(article_downloader_task.task_role)
         opensearch_domain.grant_read_write(article_downloader_task.task_role)
 
-        # ECS security group (create once and reuse)
+        # ECS security group
         ecs_security_group = self._create_ecs_security_group(vpc)
 
-        # ECS service for article downloader (using public subnets for demo)
+        # ECS service
         article_downloader_service = ecs.FargateService(
             self, "ArticleDownloaderService",
             cluster=ecs_cluster,
@@ -290,14 +336,14 @@ class NewsInsightsStack(Stack):
             security_groups=[ecs_security_group]
         )
 
-        # Lambda security group (create once and reuse)
-        lambda_security_group = self._create_lambda_security_group(vpc)
+        return ecs_cluster, article_downloader_service
 
+    def _create_lambda_layer(self) -> lambda_.LayerVersion:
+        """Create Lambda layer for dependencies"""
         # Build or check for Lambda layer
         layer_path = build_lambda_layer()
         
-        # Lambda layer for dependencies (using standard LayerVersion)
-        lambda_layer = lambda_.LayerVersion(
+        return lambda_.LayerVersion(
             self, "NewsInsightsDependenciesLayer",
             code=lambda_.Code.from_asset(layer_path),
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_12],
@@ -305,7 +351,18 @@ class NewsInsightsStack(Stack):
             description="Redis and OpenSearch dependencies for news insights"
         )
 
-        # Lambda function for data replication (CDC)
+    def _create_lambda_functions(
+        self,
+        vpc: ec2.IVpc,
+        redis_cluster: elasticache.CfnReplicationGroup,
+        opensearch_domain: opensearch.Domain,
+        lambda_layer: lambda_.LayerVersion
+    ) -> Tuple[lambda_.Function, lambda_.Function]:
+        """Create Lambda functions for data processing and search API"""
+        # Lambda security group
+        lambda_security_group = self._create_lambda_security_group(vpc)
+
+        # Data replicator Lambda function
         data_replicator = lambda_.Function(
             self, "DataReplicator",
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -326,16 +383,7 @@ class NewsInsightsStack(Stack):
         # Grant permissions to data replicator
         opensearch_domain.grant_read_write(data_replicator)
 
-        # EventBridge rule to trigger data replication
-        replication_rule = events.Rule(
-            self, "DataReplicationRule",
-            description="Trigger data replication every 5 minutes",
-            schedule=events.Schedule.rate(Duration.minutes(5))
-        )
-
-        replication_rule.add_target(targets.LambdaFunction(data_replicator))
-
-        # Lambda function for search API
+        # Search API Lambda function
         search_api = lambda_.Function(
             self, "SearchAPI",
             runtime=lambda_.Runtime.PYTHON_3_12,
@@ -355,7 +403,11 @@ class NewsInsightsStack(Stack):
         # Grant permissions to search API
         opensearch_domain.grant_read(search_api)
 
-        # API Gateway for search API
+        return data_replicator, search_api
+
+    def _create_api_gateway(self, search_api: lambda_.Function) -> apigateway.RestApi:
+        """Create API Gateway for search API"""
+        # API Gateway
         search_api_gateway = apigateway.RestApi(
             self, "NewsSearchAPI",
             rest_api_name="news-search-api",
@@ -382,6 +434,24 @@ class NewsInsightsStack(Stack):
             ]
         )
 
+        return search_api_gateway
+
+    def _create_eventbridge_rules(
+        self,
+        data_replicator: lambda_.Function,
+        ecs_cluster: ecs.Cluster,
+        article_downloader_service: ecs.FargateService
+    ) -> None:
+        """Create EventBridge rules for scheduling"""
+        # EventBridge rule to trigger data replication
+        replication_rule = events.Rule(
+            self, "DataReplicationRule",
+            description="Trigger data replication every 5 minutes",
+            schedule=events.Schedule.rate(Duration.minutes(5))
+        )
+
+        replication_rule.add_target(targets.LambdaFunction(data_replicator))
+
         # EventBridge rule for scheduled article downloading
         download_rule = events.Rule(
             self, "ArticleDownloadRule",
@@ -389,14 +459,22 @@ class NewsInsightsStack(Stack):
             schedule=events.Schedule.rate(Duration.hours(1))
         )
 
+        # Get the task definition from the service
+        task_definition = article_downloader_service.task_definition
+
         download_rule.add_target(targets.EcsTask(
             cluster=ecs_cluster,
-            task_definition=article_downloader_task,
+            task_definition=task_definition,
             subnet_selection=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[ecs_security_group]
+            security_groups=article_downloader_service.connections.security_groups
         ))
 
-        # Outputs
+    def _create_outputs(
+        self,
+        search_api_gateway: apigateway.RestApi,
+        opensearch_domain: opensearch.Domain
+    ) -> None:
+        """Create CloudFormation outputs"""
         CfnOutput(
             self, "SearchAPIURL",
             value=search_api_gateway.url,

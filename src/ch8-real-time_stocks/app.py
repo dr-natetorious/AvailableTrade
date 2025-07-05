@@ -131,16 +131,23 @@ log.retention.bytes=1073741824
 """.strip()
         )
 
+        # Get subnets sorted by preference: private subnets first, then public subnets
+        all_subnets = list(vpc.private_subnets) + list(vpc.public_subnets)
+        selected_subnets = all_subnets[:2]  # Take first 2 subnets
+        
+        if len(selected_subnets) < 2:
+            raise ValueError(f"VPC must have at least 2 subnets for MSK cluster. Found {len(all_subnets)} subnets.")
+
         # MSK cluster
         msk_cluster = msk.CfnCluster(
             self, "StockDataCluster",
             cluster_name="realtime-stocks-cluster",
-            kafka_version="4.0.0",
+            kafka_version="3.8.x",
             number_of_broker_nodes=2,
             broker_node_group_info=msk.CfnCluster.BrokerNodeGroupInfoProperty(
                 instance_type="kafka.t3.small",
                 client_subnets=[
-                    subnet.subnet_id for subnet in vpc.private_subnets[:2]
+                    subnet.subnet_id for subnet in selected_subnets
                 ],
                 storage_info=msk.CfnCluster.StorageInfoProperty(
                     ebs_storage_info=msk.CfnCluster.EBSStorageInfoProperty(
