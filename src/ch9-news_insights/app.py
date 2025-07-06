@@ -169,20 +169,23 @@ class NewsInsightsStack(Stack):
         # Get or create default VPC (cost-efficient approach for tutorials)
         vpc = get_or_create_default_vpc(self)
 
+        # Create shared security group for all services
+        shared_security_group = self._create_shared_security_group(vpc)
+
         # Create core infrastructure components
         articles_bucket = self._create_s3_bucket()
-        redis_cluster, redis_security_group = self._create_redis_cluster(vpc)
-        opensearch_domain, opensearch_security_group = self._create_opensearch_cluster(vpc)
+        redis_cluster = self._create_redis_cluster(vpc, shared_security_group)
+        opensearch_domain = self._create_opensearch_cluster(vpc, shared_security_group)
         
         # Create ECS components for article downloading
         ecs_cluster, article_downloader_service = self._create_ecs_components(
-            vpc, articles_bucket, redis_cluster, opensearch_domain
+            vpc, articles_bucket, redis_cluster, opensearch_domain, shared_security_group
         )
         
         # Create Lambda components for data processing
         lambda_layer = self._create_lambda_layer()
         data_replicator, search_api = self._create_lambda_functions(
-            vpc, redis_cluster, opensearch_domain, lambda_layer
+            vpc, redis_cluster, opensearch_domain, lambda_layer, shared_security_group
         )
         
         # Create API Gateway
@@ -193,6 +196,38 @@ class NewsInsightsStack(Stack):
         
         # Create outputs
         self._create_outputs(search_api_gateway, opensearch_domain)
+
+    def _create_shared_security_group(self, vpc: ec2.IVpc) -> ec2.SecurityGroup:
+        """Create a single security group for all services in the tutorial"""
+        sg = ec2.SecurityGroup(
+            self, "NewsInsightsSecurityGroup",
+            vpc=vpc,
+            description="Security group for all News Insights services",
+            allow_all_outbound=True
+        )
+        
+        # Allow all traffic within the security group (services can talk to each other)
+        sg.add_ingress_rule(
+            peer=sg,
+            connection=ec2.Port.all_traffic(),
+            description="Allow all communication within News Insights services"
+        )
+        
+        # Allow Redis access from VPC
+        sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(6379),
+            description="Redis access from VPC"
+        )
+        
+        # Allow OpenSearch access from VPC
+        sg.add_ingress_rule(
+            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(443),
+            description="OpenSearch HTTPS access from VPC"
+        )
+        
+        return sg
 
     def _create_s3_bucket(self) -> s3.Bucket:
         """Create S3 bucket for storing downloaded articles"""
@@ -205,27 +240,13 @@ class NewsInsightsStack(Stack):
             auto_delete_objects=True
         )
 
-    def _create_redis_cluster(self, vpc: ec2.IVpc) -> Tuple[elasticache.CfnReplicationGroup, ec2.SecurityGroup]:
+    def _create_redis_cluster(self, vpc: ec2.IVpc, security_group: ec2.SecurityGroup) -> elasticache.CfnReplicationGroup:
         """Create Redis cluster for MemoryDB and CDC"""
         # Redis subnet group
         redis_subnet_group = elasticache.CfnSubnetGroup(
             self, "RedisSubnetGroup",
             description="Subnet group for Redis cluster",
             subnet_ids=[subnet.subnet_id for subnet in vpc.public_subnets]
-        )
-
-        # Redis security group
-        redis_security_group = ec2.SecurityGroup(
-            self, "RedisSecurityGroup",
-            vpc=vpc,
-            description="Security group for Redis cluster",
-            allow_all_outbound=True
-        )
-
-        redis_security_group.add_ingress_rule(
-            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            connection=ec2.Port.tcp(6379),
-            description="Redis access from VPC"
         )
 
         # Redis cluster
@@ -236,30 +257,16 @@ class NewsInsightsStack(Stack):
             engine="redis",
             num_cache_clusters=1,
             cache_subnet_group_name=redis_subnet_group.ref,
-            security_group_ids=[redis_security_group.security_group_id],
+            security_group_ids=[security_group.security_group_id],
             automatic_failover_enabled=False,
             multi_az_enabled=False
         )
 
-        return redis_cluster, redis_security_group
+        return redis_cluster
 
-    def _create_opensearch_cluster(self, vpc: ec2.IVpc) -> Tuple[opensearch.Domain, ec2.SecurityGroup]:
+    def _create_opensearch_cluster(self, vpc: ec2.IVpc, security_group: ec2.SecurityGroup) -> opensearch.Domain:
         """Create OpenSearch cluster for search capabilities"""
-        # OpenSearch security group
-        opensearch_security_group = ec2.SecurityGroup(
-            self, "OpenSearchSecurityGroup",
-            vpc=vpc,
-            description="Security group for OpenSearch cluster",
-            allow_all_outbound=True
-        )
-
-        opensearch_security_group.add_ingress_rule(
-            peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
-            connection=ec2.Port.tcp(443),
-            description="OpenSearch HTTPS access from VPC"
-        )
-
-        # OpenSearch domain
+        # OpenSearch domain - requires exactly one subnet for single node
         opensearch_domain = opensearch.Domain(
             self, "NewsSearchDomain",
             version=opensearch.EngineVersion.OPENSEARCH_2_11,
@@ -272,19 +279,23 @@ class NewsInsightsStack(Stack):
                 volume_type=ec2.EbsDeviceVolumeType.GP3
             ),
             vpc=vpc,
-            vpc_subnets=[ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC, one_per_az=True)],
-            security_groups=[opensearch_security_group],
+            vpc_subnets=[ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PUBLIC, 
+                availability_zones=[vpc.availability_zones[0]]  # Use exactly one subnet
+            )],
+            security_groups=[security_group],
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        return opensearch_domain, opensearch_security_group
+        return opensearch_domain
 
     def _create_ecs_components(
         self, 
         vpc: ec2.IVpc, 
         articles_bucket: s3.Bucket, 
         redis_cluster: elasticache.CfnReplicationGroup,
-        opensearch_domain: opensearch.Domain
+        opensearch_domain: opensearch.Domain,
+        security_group: ec2.SecurityGroup
     ) -> Tuple[ecs.Cluster, ecs.FargateService]:
         """Create ECS cluster and service for article downloading"""
         # ECS cluster
@@ -322,10 +333,7 @@ class NewsInsightsStack(Stack):
         articles_bucket.grant_read_write(article_downloader_task.task_role)
         opensearch_domain.grant_read_write(article_downloader_task.task_role)
 
-        # ECS security group
-        ecs_security_group = self._create_ecs_security_group(vpc)
-
-        # ECS service
+        # ECS service (using the shared security group)
         article_downloader_service = ecs.FargateService(
             self, "ArticleDownloaderService",
             cluster=ecs_cluster,
@@ -333,7 +341,7 @@ class NewsInsightsStack(Stack):
             desired_count=1,
             assign_public_ip=True,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
-            security_groups=[ecs_security_group]
+            security_groups=[security_group]
         )
 
         return ecs_cluster, article_downloader_service
@@ -356,12 +364,11 @@ class NewsInsightsStack(Stack):
         vpc: ec2.IVpc,
         redis_cluster: elasticache.CfnReplicationGroup,
         opensearch_domain: opensearch.Domain,
-        lambda_layer: lambda_.LayerVersion
+        lambda_layer: lambda_.LayerVersion,
+        security_group: ec2.SecurityGroup
     ) -> Tuple[lambda_.Function, lambda_.Function]:
         """Create Lambda functions for data processing and search API"""
-        # Lambda security group
-        lambda_security_group = self._create_lambda_security_group(vpc)
-
+        
         # Data replicator Lambda function
         data_replicator = lambda_.Function(
             self, "DataReplicator",
@@ -376,7 +383,7 @@ class NewsInsightsStack(Stack):
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             allow_public_subnet=True,
-            security_groups=[lambda_security_group],
+            security_groups=[security_group],
             layers=[lambda_layer]
         )
 
@@ -396,7 +403,7 @@ class NewsInsightsStack(Stack):
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
             allow_public_subnet=True,
-            security_groups=[lambda_security_group],
+            security_groups=[security_group],
             layers=[lambda_layer]
         )
 
@@ -486,27 +493,6 @@ class NewsInsightsStack(Stack):
             value=opensearch_domain.domain_endpoint,
             description="OpenSearch domain endpoint"
         )
-
-    def _create_ecs_security_group(self, vpc: ec2.IVpc) -> ec2.SecurityGroup:
-        """Create security group for ECS tasks"""
-        sg = ec2.SecurityGroup(
-            self, "ECSSecurityGroup",
-            vpc=vpc,
-            description="Security group for ECS tasks",
-            allow_all_outbound=True
-        )
-        return sg
-
-    def _create_lambda_security_group(self, vpc: ec2.IVpc) -> ec2.SecurityGroup:
-        """Create security group for Lambda functions"""
-        sg = ec2.SecurityGroup(
-            self, "LambdaSecurityGroup",
-            vpc=vpc,
-            description="Security group for Lambda functions",
-            allow_all_outbound=True
-        )
-        return sg
-
 
 # CDK App
 app = cdk.App()
